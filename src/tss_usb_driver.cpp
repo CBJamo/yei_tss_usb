@@ -114,6 +114,13 @@ namespace yei_tss_usb
 			return false;
 		}
 
+		if( tss_set_header_enabled( tssd, 1 ) < 0 )
+		{
+			TSSCloseNoLock( );
+			io_failure_count++;
+			return false;
+		}
+
 		if( tss_set_axis_directions( tssd, axis_config | ( invert_x_axis ? TSS_USB_INVERT_X : 0 )
 			| ( invert_y_axis ? TSS_USB_INVERT_Y : 0 ) | ( invert_z_axis ? TSS_USB_INVERT_Z : 0 ) ) < 0 )
 		{

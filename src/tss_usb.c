@@ -1,14 +1,11 @@
 /***************************************************************************//**
 * \file tss_usb.c
 *
-* \brief Standalone C Driver for the YEI 3-Space Sensor USB
+* \brief Standalone C Driver for the YEI Corp 3-Space Sensor USB
 * \author Scott K Logan
 * \date January 07, 2013
 *
-* This is a standolone C driver for the Pololu SMC family of motor
-* controllers. It uses LibUSB to interface with the system's USB drivers, and
-* is interfaced with similarly to files, in which a device is opened and is
-* referenced with an integer handle.
+* This is a standolone C driver for the YEI Corp 3-Space Sensor family of IMUs.
 *
 * \section license License (BSD-3)
 * Copyright (c) 2013, Scott K Logan\n
@@ -53,8 +50,17 @@
 #define MAX_HANDLES 256
 
 #define CMD_HEADER 0xF7
+#define CMD_HEADER_WITH_RESPONSE 0xF9
 
 #define NO_FLUSH_BUFFER 1
+
+#define HEADER_SUCCESS 0x1
+#define HEADER_TIMESTAMP 0x2
+#define HEADER_COMMAND_ECHO 0x4
+#define HEADER_ADDITIVE_CHECKSUM 0x8
+#define HEADER_LOGICAL_ID 0x10
+#define HEADER_SERIAL_NUMBER 0x20
+#define HEADER_DATA_LENGTH 0x40 
 
 enum tss_usb_commands
 {
@@ -71,6 +77,7 @@ enum tss_usb_commands
 	CMD_SET_AXIS_DIRECTIONS = 0x74,
 	CMD_RESET_KALMAN_FILTER = 0x78,
 	CMD_READ_KALMAN_FILTERS_COVARIANCE_MATRIX = 0x93,
+	CMD_SET_RESPONSE_HEADER_BITFIELD = 0xDD,
 	CMD_READ_VERSION_EXTENDED = 0xDF,
 	CMD_RESTORE_FACTORY_SETTINGS = 0xE0,
 	CMD_COMMIT_SETTINGS = 0xE1,
@@ -89,7 +96,19 @@ struct tss_usb_priv
 	char *port;
 	char *version;
 	char *version_extended;
+	unsigned char header;
 };
+
+struct tss_usb_return_header
+{
+	unsigned char retval;
+	unsigned int timestamp;
+	unsigned char cmd;
+	unsigned char checksum;
+	// unsigned char logical_id;
+	// unsigned int sernum;
+	unsigned char payload_len;
+} __attribute__((packed));
 
 /*!
  * \brief List of communication handles.
@@ -240,9 +259,15 @@ int tss_usb_open( const char *port )
 	}
 
 	/* Step 2: Set our baud rate to match the device, if necessary */
-	unsigned char buf[3] = { CMD_HEADER, CMD_GET_UART_BAUD_RATE, CMD_GET_UART_BAUD_RATE };
+
+	#ifndef NO_FLUSH_BUFFER
+	/* Clear Response Buffer */
+	tcflush( fd, TCIOFLUSH );
+	#endif
+
+	unsigned char buf[7] = { CMD_HEADER, CMD_GET_UART_BAUD_RATE, CMD_GET_UART_BAUD_RATE };
 	int ret;
-	if( ( ret = send_cmd( fd, buf, sizeof( buf ) ) ) < 0 )
+	if( ( ret = send_cmd( fd, buf, 3 * sizeof( unsigned char ) ) ) < 0 )
 	{
 		close( fd );
 		return ret;
@@ -274,7 +299,25 @@ int tss_usb_open( const char *port )
 		}
 	}
 
-	/* Step 3: Allocate a private struct */
+	/* Step 3: Setup response header */
+	
+	#ifndef NO_FLUSH_BUFFER
+	/* Clear Response Buffer */
+	tcflush( fd, TCIOFLUSH );
+	#endif
+
+	/* Construct Packet Payload */
+	buf[0] = CMD_HEADER;
+	buf[1] = CMD_SET_RESPONSE_HEADER_BITFIELD;
+	*((unsigned int *)&buf[2]) = ( HEADER_SUCCESS | HEADER_TIMESTAMP | HEADER_COMMAND_ECHO | HEADER_ADDITIVE_CHECKSUM | HEADER_DATA_LENGTH );
+	endian_swap( (unsigned int *)&buf[2] );
+	buf[6] = create_checksum( &buf[1], sizeof( buf ) - 2 );
+
+	if( ( ret = send_cmd( fd, buf, sizeof( buf ) ) ) < 0 )
+		return ret;
+
+
+	/* Step 4: Allocate a private struct */
 	int mydev = next_available_handle( );
 	if( mydev < 0 )
 	{
@@ -301,6 +344,7 @@ int tss_usb_open( const char *port )
 	memcpy( tss_usb_list[mydev]->port, port, strlen( port ) + 1 );
 	tss_usb_list[mydev]->fd = fd;
 	tss_usb_list[mydev]->baud = dev_baud;
+	tss_usb_list[mydev]->header = CMD_HEADER;
 
 	return TSS_USB_SUCCESS;
 }
@@ -320,6 +364,13 @@ void tss_usb_close( const int tssd )
 	tss_usb_list[tssd] = NULL;
 }
 
+int tss_set_header_enabled( const int tssd, char enable )
+{
+	tss_usb_list[tssd]->header = enable ? CMD_HEADER_WITH_RESPONSE : CMD_HEADER;
+
+	return TSS_USB_SUCCESS;
+}
+
 int tss_get_led( const int tssd, float vals[3] )
 {
 	#ifndef NO_FLUSH_BUFFER
@@ -328,15 +379,35 @@ int tss_get_led( const int tssd, float vals[3] )
 	#endif
 
 	/* Construct Packet Payload */
-	unsigned char buf[3] = { CMD_HEADER, CMD_GET_LED_COLOR, CMD_GET_LED_COLOR };
+	unsigned char buf[3] = { tss_usb_list[tssd]->header, CMD_GET_LED_COLOR, CMD_GET_LED_COLOR };
 	int ret;
 
 	if( ( ret = send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) ) ) < 0 )
 		return ret;
 
-	/* Read Response */
-	if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)vals, 3 * sizeof( float ) ) ) < 0 )
-		return ret;
+	/* If Headers Are Enabled Read Header And Response */
+	if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE )
+	{
+		struct tss_usb_return_header hdr;
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)&hdr, sizeof( struct tss_usb_return_header ) ) ) < 0 )
+			return ret;
+		endian_swap( &hdr.timestamp );
+
+		if( hdr.payload_len != 3 * sizeof( float ) )
+			return TSS_USB_ERROR_PAYLOAD_MISMATCH;
+	
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)vals, 3 * sizeof( float ) ) ) < 0 )
+			return ret;
+	
+		if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE && create_checksum( (unsigned char *)vals, 3 * sizeof( float ) ) != hdr.checksum )
+			return TSS_USB_ERROR_CHECKSUM;
+	}
+	/* Else Read Only Response */
+	else
+	{
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)vals, 3 * sizeof( float ) ) ) < 0 )
+			return ret;
+	}
 
 	endian_swap( (unsigned int *)&vals[0] );
 	endian_swap( (unsigned int *)&vals[1] );
@@ -348,7 +419,8 @@ int tss_get_led( const int tssd, float vals[3] )
 int tss_set_led( const int tssd, const float vals[3] )
 {
 	/* Construct Packet Payload */
-	unsigned char buf[2 + 3 * sizeof( float ) + 1] = { CMD_HEADER, CMD_SET_LED_COLOR };
+	unsigned char buf[2 + 3 * sizeof( float ) + 1] = { tss_usb_list[tssd]->header, CMD_SET_LED_COLOR };
+	int ret;
 	memcpy( &buf[2], &vals[0], sizeof( float ) );
 	endian_swap( (unsigned int *)&buf[2] );
 	memcpy( &buf[2 + sizeof( float )], &vals[1], sizeof( float ) );
@@ -357,7 +429,23 @@ int tss_set_led( const int tssd, const float vals[3] )
 	endian_swap( (unsigned int *)&buf[2 + 2 * sizeof( float )] );
 	buf[2 + 3 * sizeof( float )] = create_checksum( &buf[1], sizeof( buf ) - 2 );
 
-	return send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) );
+	if( ( ret = send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) ) ) > 0  )
+		return ret;
+
+	/* If Headers Are Enabled Read Header */
+	if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE )
+	{
+		struct tss_usb_return_header hdr;
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)&hdr, sizeof( struct tss_usb_return_header ) ) ) < 0 )
+			return ret;
+
+		endian_swap( &hdr.timestamp );
+
+		if( hdr.payload_len != 0 )
+			return TSS_USB_ERROR_PAYLOAD_MISMATCH;
+	}
+	
+	return TSS_USB_SUCCESS;
 }
 
 int tss_get_orientation_quaternion( const int tssd, float vals[4] )
@@ -368,15 +456,35 @@ int tss_get_orientation_quaternion( const int tssd, float vals[4] )
 	#endif
 
 	/* Construct Packet Payload */
-	unsigned char buf[3] = { CMD_HEADER, CMD_READ_FILTERED_TARED_ORIENTATION_QUATERNION, CMD_READ_FILTERED_TARED_ORIENTATION_QUATERNION };
+	unsigned char buf[3] = { tss_usb_list[tssd]->header, CMD_READ_FILTERED_TARED_ORIENTATION_QUATERNION, CMD_READ_FILTERED_TARED_ORIENTATION_QUATERNION };
 	int ret;
 
 	if( ( ret = send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) ) ) < 0 )
 		return ret;
 
-	/* Read Response */
-	if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)vals, 4 * sizeof( float ) ) ) < 0 )
-		return ret;
+	/* If Headers Are Enabled Read Header And Response */
+	if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE )
+	{
+		struct tss_usb_return_header hdr;
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)&hdr, sizeof( struct tss_usb_return_header ) ) ) < 0 )
+			return ret;
+		endian_swap( &hdr.timestamp );
+
+		if( hdr.payload_len != 4 * sizeof( float ) )
+			return TSS_USB_ERROR_PAYLOAD_MISMATCH;
+
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)vals, 4 * sizeof( float ) ) ) < 0 )
+			return ret;
+
+		if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE && create_checksum( (unsigned char *)vals, 4 * sizeof( float ) ) != hdr.checksum )
+			return TSS_USB_ERROR_CHECKSUM;
+	}
+	/* Else Read Only Response */
+	else
+	{
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)vals, 4 * sizeof( float ) ) ) < 0 )
+			return ret;
+	}
 
 	endian_swap( (unsigned int *)&vals[0] );
 	endian_swap( (unsigned int *)&vals[1] );
@@ -394,15 +502,36 @@ int tss_get_filtered_gyro( const int tssd, float vals[3] )
 	#endif
 
 	/* Construct Packet Payload */
-	unsigned char buf[3] = { CMD_HEADER, CMD_READ_NORMALIZED_GYROS, CMD_READ_NORMALIZED_GYROS };
+	unsigned char buf[3] = { tss_usb_list[tssd]->header, CMD_READ_NORMALIZED_GYROS, CMD_READ_NORMALIZED_GYROS };
 	int ret;
 
 	if( ( ret = send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) ) ) < 0 )
 		return ret;
 
-	/* Read Response */
-	if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)vals, 3 * sizeof( float ) ) ) < 0 )
-		return ret;
+	/* If Headers Are Enabled Read Header And Response */
+	if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE )
+	{
+		struct tss_usb_return_header hdr;
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)&hdr, sizeof( struct tss_usb_return_header ) ) ) < 0 )
+			return ret;
+		endian_swap( &hdr.timestamp );
+
+		if( hdr.payload_len != 3 * sizeof( float ) )
+			return TSS_USB_ERROR_PAYLOAD_MISMATCH;
+
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)vals, 3 * sizeof( float ) ) ) < 0 )
+			return ret;
+
+		if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE && create_checksum( (unsigned char *)vals, 3 * sizeof( float ) ) != hdr.checksum )
+			return TSS_USB_ERROR_CHECKSUM;
+	}
+	/* Else Read Only Response */
+	else
+	{
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)vals, 3 * sizeof( float ) ) ) < 0 )
+			return ret;
+	}
+
 
 	endian_swap( (unsigned int *)&vals[0] );
 	endian_swap( (unsigned int *)&vals[1] );
@@ -419,15 +548,36 @@ int tss_get_normalized_accel( const int tssd, float vals[3] )
 	#endif
 
 	/* Construct Packet Payload */
-	unsigned char buf[3] = { CMD_HEADER, CMD_READ_NORMALIZED_ACCELEROMETER, CMD_READ_NORMALIZED_ACCELEROMETER };
+	unsigned char buf[3] = { tss_usb_list[tssd]->header, CMD_READ_NORMALIZED_ACCELEROMETER, CMD_READ_NORMALIZED_ACCELEROMETER };
 	int ret;
 
 	if( ( ret = send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) ) ) < 0 )
 		return ret;
 
-	/* Read Response */
-	if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)vals, 3 * sizeof( float ) ) ) < 0 )
-		return ret;
+	/* If Headers Are Enabled Read Header And Response */
+	if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE )
+	{
+		struct tss_usb_return_header hdr;
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)&hdr, sizeof( struct tss_usb_return_header ) ) ) < 0 )
+			return ret;
+		endian_swap( &hdr.timestamp );
+
+		if( hdr.payload_len != 3 * sizeof( float ) )
+			return TSS_USB_ERROR_PAYLOAD_MISMATCH;
+
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)vals, 3 * sizeof( float ) ) ) < 0 )
+			return ret;
+
+		if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE && create_checksum( (unsigned char *)vals, 3 * sizeof( float ) ) != hdr.checksum )
+			return TSS_USB_ERROR_CHECKSUM;
+	}
+	/* Else Read Only Response */
+	else
+	{
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)vals, 3 * sizeof( float ) ) ) < 0 )
+			return ret;
+	}
+
 
 	endian_swap( (unsigned int *)&vals[0] );
 	endian_swap( (unsigned int *)&vals[1] );
@@ -444,15 +594,36 @@ int tss_get_accel( const int tssd, float vals[3] )
 	#endif
 
 	/* Construct Packet Payload */
-	unsigned char buf[3] = { CMD_HEADER, CMD_READ_CORRECTED_ACCELEROMETER, CMD_READ_CORRECTED_ACCELEROMETER };
+	unsigned char buf[3] = { tss_usb_list[tssd]->header, CMD_READ_CORRECTED_ACCELEROMETER, CMD_READ_CORRECTED_ACCELEROMETER };
 	int ret;
 
 	if( ( ret = send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) ) ) < 0 )
 		return ret;
 
-	/* Read Response */
-	if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)vals, 3 * sizeof( float ) ) ) < 0 )
-		return ret;
+	/* If Headers Are Enabled Read Header And Response */
+	if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE )
+	{
+		struct tss_usb_return_header hdr;
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)&hdr, sizeof( struct tss_usb_return_header ) ) ) < 0 )
+			return ret;
+		endian_swap( &hdr.timestamp );
+
+		if( hdr.payload_len != 3 * sizeof( float ) )
+			return TSS_USB_ERROR_PAYLOAD_MISMATCH;
+
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)vals, 3 * sizeof( float ) ) ) < 0 )
+			return ret;
+
+		if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE && create_checksum( (unsigned char *)vals, 3 * sizeof( float ) ) != hdr.checksum )
+			return TSS_USB_ERROR_CHECKSUM;
+	}
+	/* Else Read Only Response */
+	else
+	{
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)vals, 3 * sizeof( float ) ) ) < 0 )
+			return ret;
+	}
+
 
 	endian_swap( (unsigned int *)&vals[0] );
 	endian_swap( (unsigned int *)&vals[1] );
@@ -469,16 +640,37 @@ int tss_get_covariance( const int tssd, float vals[16] )
 	#endif
 
 	/* Construct Packet Payload */
-	unsigned char buf[3] = { CMD_HEADER, CMD_READ_KALMAN_FILTERS_COVARIANCE_MATRIX, CMD_READ_KALMAN_FILTERS_COVARIANCE_MATRIX };
+	unsigned char buf[3] = { tss_usb_list[tssd]->header, CMD_READ_KALMAN_FILTERS_COVARIANCE_MATRIX, CMD_READ_KALMAN_FILTERS_COVARIANCE_MATRIX };
 	int ret;
 	unsigned char i;
 
 	if( ( ret = send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) ) ) < 0 )
 		return ret;
 
-	/* Read Response */
-	if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)vals, 9 * sizeof( float ) ) ) < 0 )
-		return ret;
+	/* If Headers Are Enabled Read Header And Response */
+	if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE )
+	{
+		struct tss_usb_return_header hdr;
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)&hdr, sizeof( struct tss_usb_return_header ) ) ) < 0 )
+			return ret;
+		endian_swap( &hdr.timestamp );
+
+		if( hdr.payload_len != 16 * sizeof( float ) )
+			return TSS_USB_ERROR_PAYLOAD_MISMATCH;
+
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)vals, 16 * sizeof( float ) ) ) < 0 )
+			return ret;
+
+		if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE && create_checksum( (unsigned char *)vals, 16 * sizeof( float ) ) != hdr.checksum )
+			return TSS_USB_ERROR_CHECKSUM;
+	}
+	/* Else Read Only Response */
+	else
+	{
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)vals, 16 * sizeof( float ) ) ) < 0 )
+			return ret;
+	}
+
 
 	for( i = 0; i < 16; i++ )
 		endian_swap( (unsigned int *)&vals[i] );
@@ -489,15 +681,34 @@ int tss_get_covariance( const int tssd, float vals[16] )
 int tss_set_axis_directions( const int tssd, const unsigned char val )
 {
 	/* Construct Packet Payload */
-	unsigned char buf[2 + sizeof( unsigned char ) + 1] = { CMD_HEADER, CMD_SET_AXIS_DIRECTIONS };
+	unsigned char buf[2 + sizeof( unsigned char ) + 1] = { tss_usb_list[tssd]->header, CMD_SET_AXIS_DIRECTIONS };
+	int ret;
 	memcpy( &buf[2], &val, sizeof( unsigned char ) );
 	buf[2 + sizeof( unsigned char )] = create_checksum( &buf[1], sizeof( buf ) - 2 );
 
-	return send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) );
+	if( ( ret = send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) ) ) < 0)
+		return ret;
+
+	/* If Headers Are Enabled Read Header */
+	if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE )
+	{
+		struct tss_usb_return_header hdr;
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)&hdr, sizeof( struct tss_usb_return_header ) ) ) < 0 )
+			return ret;
+
+		endian_swap( &hdr.timestamp );
+
+		if( hdr.payload_len != 0 )
+			return TSS_USB_ERROR_PAYLOAD_MISMATCH;
+	}
+
+	return TSS_USB_SUCCESS;
 }
 
 int tss_get_version( const int tssd, char vals[33] )
 {
+	int ret = TSS_USB_SUCCESS;
+
 	if( !tss_usb_list[tssd]->version )
 	{
 		#ifndef NO_FLUSH_BUFFER
@@ -506,31 +717,58 @@ int tss_get_version( const int tssd, char vals[33] )
 		#endif
 
 		/* Construct Packet Payload */
-		unsigned char buf[3] = { CMD_HEADER, CMD_GET_VERSION, CMD_GET_VERSION };
-		int ret;
+		unsigned char buf[3] = { tss_usb_list[tssd]->header, CMD_GET_VERSION, CMD_GET_VERSION };
 
 		if( ( ret = send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) ) ) < 0 )
 			return ret;
 
-		tss_usb_list[tssd]->version = malloc( 33 * sizeof( char ) );
+		tss_usb_list[tssd]->version = calloc( 33, sizeof( char ) );
 		tss_usb_list[tssd]->version[32] = '\0';
 
-		/* Read Response */
-		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)tss_usb_list[tssd]->version, 32 * sizeof( char ) ) ) < 0 )
+		/* If Headers Are Enabled Read Header And Response */
+		if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE )
 		{
-			free( tss_usb_list[tssd]->version );
-			tss_usb_list[tssd]->version = NULL;
-			return ret;
+			struct tss_usb_return_header hdr;
+			if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)&hdr, sizeof( struct tss_usb_return_header ) ) ) < 0 )
+				goto comm_err;
+			endian_swap( &hdr.timestamp );
+
+			if( hdr.payload_len != 32 * sizeof( char ) )
+			{
+				ret = TSS_USB_ERROR_PAYLOAD_MISMATCH;
+				goto comm_err;
+			}	
+
+			if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)tss_usb_list[tssd]->version, 32 * sizeof( char ) ) ) < 0 )
+				goto comm_err;
+
+			if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE && create_checksum( (unsigned char *)tss_usb_list[tssd]->version, 32 * sizeof( char ) ) != hdr.checksum )
+			{
+				ret = TSS_USB_ERROR_CHECKSUM;
+				goto comm_err;
+			}
+		}
+		/* Else Read Only Response */
+		else
+		{
+			if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)tss_usb_list[tssd]->version, 32 * sizeof( char ) ) ) < 0 )
+				return ret;
 		}
 	}
 
 	memcpy( vals, tss_usb_list[tssd]->version, 33 * sizeof( char ) );
 
-	return TSS_USB_SUCCESS;
+	return ret;
+
+comm_err:
+	free( tss_usb_list[tssd]->version );
+	tss_usb_list[tssd]->version = NULL;
+	return ret;
 }
 
 int tss_get_version_extended( const int tssd, char vals[13] )
 {
+	int ret = TSS_USB_SUCCESS;
 	if( !tss_usb_list[tssd]->version_extended )
 	{
 		#ifndef NO_FLUSH_BUFFER
@@ -539,80 +777,230 @@ int tss_get_version_extended( const int tssd, char vals[13] )
 		#endif
 
 		/* Construct Packet Payload */
-		unsigned char buf[3] = { CMD_HEADER, CMD_READ_VERSION_EXTENDED, CMD_READ_VERSION_EXTENDED };
-		int ret;
+		unsigned char buf[3] = { tss_usb_list[tssd]->header, CMD_READ_VERSION_EXTENDED, CMD_READ_VERSION_EXTENDED };
 
 		if( ( ret = send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) ) ) < 0 )
 			return ret;
 
-		tss_usb_list[tssd]->version_extended = malloc( 13 * sizeof( char ) );
+		tss_usb_list[tssd]->version_extended = calloc( 13, sizeof( char ) );
 		tss_usb_list[tssd]->version_extended[12] = '\0';
 
-		/* Read Response */
-		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)tss_usb_list[tssd]->version_extended, 12 * sizeof( char ) ) ) < 0 )
+		/* If Headers Are Enabled Read Header And Response */
+		if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE )
 		{
-			printf( "Got %s\n", tss_usb_list[tssd]->version_extended );
-			free( tss_usb_list[tssd]->version_extended );
-			tss_usb_list[tssd]->version_extended = NULL;
-			return ret;
+			struct tss_usb_return_header hdr;
+			if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)&hdr, sizeof( struct tss_usb_return_header ) ) ) < 0 )
+				goto comm_err;
+			endian_swap( &hdr.timestamp );
+
+			if( hdr.payload_len != 12 * sizeof( char ) )
+			{	
+				ret = TSS_USB_ERROR_PAYLOAD_MISMATCH;
+				goto comm_err;
+			}
+
+			if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)tss_usb_list[tssd]->version, 12 * sizeof( char ) ) ) < 0 )
+				goto comm_err;
+
+			if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE && create_checksum( (unsigned char *)tss_usb_list[tssd]->version, 12 * sizeof( char ) ) != hdr.checksum ) 
+			{
+				ret = TSS_USB_ERROR_CHECKSUM;
+				goto comm_err;
+			}
+		}
+		/* Else Read Only Response */
+		else
+		{
+			if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)tss_usb_list[tssd]->version, 12 * sizeof( char ) ) ) < 0 )
+				return ret;
 		}
 	}
 
 	memcpy( vals, tss_usb_list[tssd]->version_extended, 13 * sizeof( char ) );
 
 	return TSS_USB_SUCCESS;
+
+comm_err:
+	free( tss_usb_list[tssd]->version_extended );
+	tss_usb_list[tssd]->version_extended = NULL;
+	return ret;
 }
 
 int tss_reset_kalman_filter( const int tssd )
 {
 	/* Construct Packet Payload */
-	unsigned char buf[3] = { CMD_HEADER, CMD_RESET_KALMAN_FILTER, CMD_RESET_KALMAN_FILTER };
-	return send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) );
+	unsigned char buf[3] = { tss_usb_list[tssd]->header, CMD_RESET_KALMAN_FILTER, CMD_RESET_KALMAN_FILTER };
+	int ret;
+
+	if( ( ret = send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) ) ) < 0)
+		return ret;
+
+	/* If Headers Are Enabled Read Header */
+	if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE )
+	{
+		struct tss_usb_return_header hdr;
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)&hdr, sizeof( struct tss_usb_return_header ) ) ) < 0 )
+			return ret;
+
+		endian_swap( &hdr.timestamp );
+
+		if( hdr.payload_len != 0 )
+			return TSS_USB_ERROR_PAYLOAD_MISMATCH;
+	}
+
+	return TSS_USB_SUCCESS;
 }
 
 int tss_tare( const int tssd )
 {
 	/* Construct Packet Payload */
-	unsigned char buf[3] = { CMD_HEADER, CMD_TARE_WITH_CURRENT_ORIENTATION, CMD_TARE_WITH_CURRENT_ORIENTATION };
-	return send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) );
+	unsigned char buf[3] = { tss_usb_list[tssd]->header, CMD_TARE_WITH_CURRENT_ORIENTATION, CMD_TARE_WITH_CURRENT_ORIENTATION };
+	int ret;
+
+	if( ( ret = send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) ) ) < 0)
+		return ret;
+
+	/* If Headers Are Enabled Read Header */
+	if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE )
+	{
+		struct tss_usb_return_header hdr;
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)&hdr, sizeof( struct tss_usb_return_header ) ) ) < 0 )
+			return ret;
+
+		endian_swap( &hdr.timestamp );
+
+		if( hdr.payload_len != 0 )
+			return TSS_USB_ERROR_PAYLOAD_MISMATCH;
+	}
+
+	return TSS_USB_SUCCESS;
 }
 
 int tss_commit( const int tssd )
 {
 	/* Construct Packet Payload */
-	unsigned char buf[3] = { CMD_HEADER, CMD_COMMIT_SETTINGS, CMD_COMMIT_SETTINGS };
-	return send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) );
+	unsigned char buf[3] = { tss_usb_list[tssd]->header, CMD_COMMIT_SETTINGS, CMD_COMMIT_SETTINGS };
+	int ret;
+
+	if( ( ret = send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) ) ) < 0)
+		return ret;
+
+	/* If Headers Are Enabled Read Header */
+	if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE )
+	{
+		struct tss_usb_return_header hdr;
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)&hdr, sizeof( struct tss_usb_return_header ) ) ) < 0 )
+			return ret;
+
+		endian_swap( &hdr.timestamp );
+
+		if( hdr.payload_len != 0 )
+			return TSS_USB_ERROR_PAYLOAD_MISMATCH;
+	}
+
+	return TSS_USB_SUCCESS;
 }
 
 int tss_reset( const int tssd )
 {
 	/* Construct Packet Payload */
-	unsigned char buf[3] = { CMD_HEADER, CMD_SOFTWARE_RESET, CMD_SOFTWARE_RESET };
-	return send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) );
+	unsigned char buf[3] = { tss_usb_list[tssd]->header, CMD_SOFTWARE_RESET, CMD_SOFTWARE_RESET };
+	int ret;
+
+	if( ( ret = send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) ) ) < 0)
+		return ret;
+
+	/* If Headers Are Enabled Read Header */
+	if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE )
+	{
+		struct tss_usb_return_header hdr;
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)&hdr, sizeof( struct tss_usb_return_header ) ) ) < 0 )
+			return ret;
+
+		endian_swap( &hdr.timestamp );
+
+		if( hdr.payload_len != 0 )
+			return TSS_USB_ERROR_PAYLOAD_MISMATCH;
+	}
+
+	return TSS_USB_SUCCESS;
 }
 
 int tss_restore_factory_settings( const int tssd )
 {
 	/* Construct Packet Payload */
-	unsigned char buf[3] = { CMD_HEADER, CMD_RESTORE_FACTORY_SETTINGS, CMD_RESTORE_FACTORY_SETTINGS };
-	return send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) );
+	unsigned char buf[3] = { tss_usb_list[tssd]->header, CMD_RESTORE_FACTORY_SETTINGS, CMD_RESTORE_FACTORY_SETTINGS };
+	int ret;
+
+	if( ( ret = send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) ) ) < 0)
+		return ret;
+
+	/* If Headers Are Enabled Read Header */
+	if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE )
+	{
+		struct tss_usb_return_header hdr;
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)&hdr, sizeof( struct tss_usb_return_header ) ) ) < 0 )
+			return ret;
+
+		endian_swap( &hdr.timestamp );
+
+		if( hdr.payload_len != 0 )
+			return TSS_USB_ERROR_PAYLOAD_MISMATCH;
+	}
+
+	return TSS_USB_SUCCESS;
 }
 
 int tss_set_multi_reference_vectors( const int tssd )
 {
 	/* Construct Packet Payload */
-	unsigned char buf[3] = { CMD_HEADER, CMD_SET_MULTI_REFERENCE_VECTORS_WITH_CURRENT_ORIENTATION, CMD_SET_MULTI_REFERENCE_VECTORS_WITH_CURRENT_ORIENTATION };
-	return send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) );
+	unsigned char buf[3] = { tss_usb_list[tssd]->header, CMD_SET_MULTI_REFERENCE_VECTORS_WITH_CURRENT_ORIENTATION, CMD_SET_MULTI_REFERENCE_VECTORS_WITH_CURRENT_ORIENTATION };
+	int ret;
+
+	if( ( ret = send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) ) ) < 0)
+		return ret;
+
+	/* If Headers Are Enabled Read Header */
+	if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE )
+	{
+		struct tss_usb_return_header hdr;
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)&hdr, sizeof( struct tss_usb_return_header ) ) ) < 0 )
+			return ret;
+
+		endian_swap( &hdr.timestamp );
+
+		if( hdr.payload_len != 0 )
+			return TSS_USB_ERROR_PAYLOAD_MISMATCH;
+	}
+
+	return TSS_USB_SUCCESS;
 }
 
 int tss_set_reference_mode( const int tssd, const unsigned char val )
 {
 	/* Construct Packet Payload */
-	unsigned char buf[2 + sizeof( unsigned char ) + 1] = { CMD_HEADER, CMD_SET_REFERENCE_VECTOR_MODE };
+	unsigned char buf[2 + sizeof( unsigned char ) + 1] = { tss_usb_list[tssd]->header, CMD_SET_REFERENCE_VECTOR_MODE };
+	int ret;
 	memcpy( &buf[2], &val, sizeof( unsigned char ) );
 	buf[2 + sizeof( unsigned char )] = create_checksum( &buf[1], sizeof( buf ) - 2 );
 
-	return send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) );
+	if( ( ret = send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) ) ) < 0)
+		return ret;
+
+	/* If Headers Are Enabled Read Header */
+	if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE )
+	{
+		struct tss_usb_return_header hdr;
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)&hdr, sizeof( struct tss_usb_return_header ) ) ) < 0 )
+			return ret;
+
+		endian_swap( &hdr.timestamp );
+
+		if( hdr.payload_len != 0 )
+			return TSS_USB_ERROR_PAYLOAD_MISMATCH;
+	}
+
+	return TSS_USB_SUCCESS;
 }
 
 int tss_get_temperature_c( const int tssd, float *val )
@@ -623,15 +1011,36 @@ int tss_get_temperature_c( const int tssd, float *val )
 	#endif
 
 	/* Construct Packet Payload */
-	unsigned char buf[3] = { CMD_HEADER, CMD_GET_TEMPERATURE_C, CMD_GET_TEMPERATURE_C };
+	unsigned char buf[3] = { tss_usb_list[tssd]->header, CMD_GET_TEMPERATURE_C, CMD_GET_TEMPERATURE_C };
 	int ret;
 
 	if( ( ret = send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) ) ) < 0 )
 		return ret;
 
-	/* Read Response */
-	if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)val, sizeof( float ) ) ) < 0 )
-		return ret;
+	/* If Headers Are Enabled Read Header And Response */
+	if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE )
+	{
+		struct tss_usb_return_header hdr;
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)&hdr, sizeof( struct tss_usb_return_header ) ) ) < 0 )
+			return ret;
+		endian_swap( &hdr.timestamp );
+
+		if( hdr.payload_len != sizeof( float ) )
+			return TSS_USB_ERROR_PAYLOAD_MISMATCH;
+
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)val, sizeof( float ) ) ) < 0 )
+			return ret;
+
+		if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE && create_checksum( (unsigned char *)val, sizeof( float ) ) != hdr.checksum )
+			return TSS_USB_ERROR_CHECKSUM;
+	}
+	/* Else Read Only Response */
+	else
+	{
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)val, sizeof( float ) ) ) < 0 )
+			return ret;
+	}
+
 
 	endian_swap( (unsigned int *)val );
 
@@ -646,15 +1055,36 @@ int tss_read_compass( const int tssd, float vals[3] )
 	#endif
 
 	/* Construct Packet Payload */
-	unsigned char buf[3] = { CMD_HEADER, CMD_READ_CORRECTED_COMPASS_VECTOR, CMD_READ_CORRECTED_COMPASS_VECTOR };
+	unsigned char buf[3] = { tss_usb_list[tssd]->header, CMD_READ_CORRECTED_COMPASS_VECTOR, CMD_READ_CORRECTED_COMPASS_VECTOR };
 	int ret;
 
 	if( ( ret = send_cmd( tss_usb_list[tssd]->fd, buf, sizeof( buf ) ) ) < 0 )
 		return ret;
 
-	/* Read Response */
-	if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)vals, 3 * sizeof( float ) ) ) < 0 )
-		return ret;
+	/* If Headers Are Enabled Read Header And Response */
+	if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE )
+	{
+		struct tss_usb_return_header hdr;
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)&hdr, sizeof( struct tss_usb_return_header ) ) ) < 0 )
+			return ret;
+		endian_swap( &hdr.timestamp );
+
+		if( hdr.payload_len != 3 * sizeof( float ) )
+			return TSS_USB_ERROR_PAYLOAD_MISMATCH;
+
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)vals, 3 * sizeof( float ) ) ) < 0 )
+			return ret;
+
+		if( tss_usb_list[tssd]->header == CMD_HEADER_WITH_RESPONSE && create_checksum( (unsigned char *)vals, 3 * sizeof( float ) ) != hdr.checksum )
+			return TSS_USB_ERROR_CHECKSUM;
+	}
+	/* Else Read Only Response */
+	else
+	{
+		if( ( ret = read_data( tss_usb_list[tssd]->fd, (unsigned char *)vals, 3 * sizeof( float ) ) ) < 0 )
+			return ret;
+	}
+
 
 	endian_swap( (unsigned int *)&vals[0] );
 	endian_swap( (unsigned int *)&vals[1] );
@@ -662,5 +1092,4 @@ int tss_read_compass( const int tssd, float vals[3] )
 
 	return TSS_USB_SUCCESS;
 }
-
 

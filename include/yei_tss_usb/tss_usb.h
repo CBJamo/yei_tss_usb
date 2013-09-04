@@ -49,7 +49,9 @@ enum tss_usb_error
 	TSS_USB_ERROR_NO_DEVICE = -4,
 	TSS_USB_ERROR_NO_MEM = -11,
 	TSS_USB_ERROR_OTHER = -13,
-	TSS_USB_ERROR_TIMEOUT = -14
+	TSS_USB_ERROR_TIMEOUT = -14,
+	TSS_USB_ERROR_CHECKSUM = -15,
+	TSS_USB_ERROR_PAYLOAD_MISMATCH = -16
 };
 
 enum tss_usb_axis_configurations
@@ -80,6 +82,7 @@ enum tss_usb_reference_vector_mode
 
 int tss_usb_open( const char *port );
 void tss_usb_close( const int tssd );
+int tss_set_header_enabled( const int tssd, char enable );
 
 int tss_get_led( const int tssd, float vals[3] );
 int tss_set_led( const int tssd, const float vals[3] );
